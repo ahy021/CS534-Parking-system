@@ -1,0 +1,168 @@
+"""
+train_lstm_gcnn.py
+==================
+End‑to‑end script that:
+1. Loads the *Paid_Parking__Last_48_Hours_.csv* dataset
+2. Cleans / reshapes it for LSTM‑GCNN training
+3. Builds a spatial adjacency matrix with k‑nearest GPS neighbours
+4. Instantiates the `LSTMGCNN` model, trains for a few epochs, and prints
+   Log‑Loss, Brier‑Score, and ROC‑AUC on a held‑out temporal validation set.
+
+
+"""
+from __future__ import annotations
+
+import argparse
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
+from sklearn.neighbors import NearestNeighbors
+from torch.utils.data import DataLoader
+
+from lstm_gcnn import ParkingDataset, LSTMGCNN, train_epoch, evaluate
+
+warnings.filterwarnings("ignore")
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def infer_column(df: pd.DataFrame, keywords: list[str]) -> str:
+    """Best‑guess column name containing *all* keyword(s)."""
+    for col in df.columns:
+        low = col.lower()
+        if all(k in low for k in keywords):
+            return col
+    raise ValueError(f"Could not infer a column with keywords {keywords}")
+
+
+def build_adjacency(df_bays: pd.DataFrame, k: int = 5) -> torch.Tensor:
+    """Compute row‑normalised adjacency with k‑nearest neighbours (Haversine)."""
+    from sklearn.metrics.pairwise import haversine_distances
+
+    coords = np.radians(df_bays[["lat", "lon"]].to_numpy())
+    dist = haversine_distances(coords)  # radians on the sphere
+    idx = np.argsort(dist, axis=1)[:, 1 : k + 1]
+    n = len(df_bays)
+    adj = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        adj[i, idx[i]] = 1.0
+    adj = np.maximum(adj, adj.T)
+    row_sum = adj.sum(1, keepdims=True) + 1e-8
+    adj = adj / row_sum
+    return torch.tensor(adj, dtype=torch.float32)
+
+
+# -----------------------------------------------------------------------------
+# Main training routine
+# -----------------------------------------------------------------------------
+
+def main(args: argparse.Namespace):
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+    df = pd.read_csv(csv_path)
+
+    print("✅ CSV loaded:", df.shape)
+    print("📄 Columns:", df.columns.tolist())
+
+    bay_col = infer_column(df, ["bay"])
+    ts_col = infer_column(df, ["time"])
+    status_col = infer_column(df, ["status"])
+    lat_col = infer_column(df, ["lat"])
+    lon_col = infer_column(df, ["lon"])
+
+    df = df.rename(
+        columns={
+            bay_col: "bay_id",
+            ts_col: "timestamp",
+            status_col: "status",
+            lat_col: "lat",
+            lon_col: "lon",
+        }
+    )
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df.sort_values(["timestamp", "bay_id"], inplace=True)
+
+    occ_map = {"occupied": 1, "present": 1, "vacant": 0, "unoccupied": 0}
+    df["occupancy"] = (
+        df["status"].astype(str).str.lower().map(occ_map).fillna(0).astype(int)
+    )
+    df["label"] = 1 - df["occupancy"]
+
+    bays = df[["bay_id", "lat", "lon"]].drop_duplicates("bay_id").reset_index(drop=True)
+    adj = build_adjacency(bays, k=args.k)
+
+    print("✅ Adjacency matrix built:", adj.shape)
+
+    ts_sorted = df["timestamp"].sort_values().unique()
+    cutoff = int(0.8 * len(ts_sorted))
+    train_ts = ts_sorted[:cutoff]
+    val_ts = ts_sorted[cutoff:]
+    train_df = df[df["timestamp"].isin(train_ts)].copy()
+    val_df = df[df["timestamp"].isin(val_ts)].copy()
+
+    features = ["occupancy"]
+
+    train_ds = ParkingDataset(train_df, seq_len=args.seq_len, horizon=args.horizon, features=features)
+    val_ds = ParkingDataset(val_df, seq_len=args.seq_len, horizon=args.horizon, features=features)
+    train_ds.adj = adj
+    val_ds.adj = adj
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = LSTMGCNN(
+        num_nodes=len(bays),
+        in_feat=len(features),
+        gcn_hidden=args.gcn_hidden,
+        lstm_hidden=args.lstm_hidden,
+        lstm_layers=args.lstm_layers,
+        dropout=args.dropout,
+    ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    criterion = nn.BCELoss()
+
+    print("✅ Starting training...")
+
+    for epoch in range(1, args.epochs + 1):
+        tr_loss = train_epoch(model, train_loader, opt, criterion, device)
+        val_metrics = evaluate(model, val_loader, device)
+        print(
+            f"Epoch {epoch:02d}/{args.epochs} | "
+            f"train_loss={tr_loss:.4f} | "
+            f"val_logloss={val_metrics['logloss']:.4f} "
+            f"brier={val_metrics['brier']:.4f} "
+            f"roc_auc={val_metrics['roc_auc']:.4f}"
+        )
+
+
+# -----------------------------------------------------------------------------
+# Argument parser
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train LSTM+GCNN on Melbourne Paid Parking dataset",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--csv", type=str, required=True, help="Path to Paid_Parking CSV file")
+    parser.add_argument("--seq_len", type=int, default=12, help="Input sequence length (time‑steps)")
+    parser.add_argument("--horizon", type=int, default=1, help="Forecast horizon (time‑steps)")
+    parser.add_argument("--batch", type=int, default=64, help="Mini‑batch size")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--k", type=int, default=5, help="k‑nearest neighbours for adjacency")
+    parser.add_argument("--gcn_hidden", type=int, default=32)
+    parser.add_argument("--lstm_hidden", type=int, default=64)
+    parser.add_argument("--lstm_layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    args = parser.parse_args()
+    main(args)
