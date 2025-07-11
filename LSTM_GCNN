@@ -1,0 +1,127 @@
+# lstm_gcnn.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+import numpy as np
+from sklearn import metrics
+
+class ParkingDataset(Dataset):
+    def __init__(
+        self,
+        df,
+        seq_len: int,
+        horizon: int,
+        features: list[str],
+        bay_ids: list[str] = None,       # ← new parameter
+    ):
+        # if no bay_ids passed, infer from this df
+        if bay_ids is None:
+            bay_ids = sorted(df["bay_id"].unique())
+        self.bay_ids = bay_ids
+        self.id2idx  = {b: i for i, b in enumerate(self.bay_ids)}
+
+        # now build your time × bay grid exactly as before...
+        times = sorted(df["timestamp"].unique())
+        T, N, Fdim = len(times), len(self.bay_ids), len(features)
+        data   = np.zeros((T, N, Fdim), dtype=np.float32)
+        labels = np.zeros((T, N),       dtype=np.int64)
+
+        for _, row in df.iterrows():
+            t = times.index(row["timestamp"])
+            # if this bay never appears in bay_ids, you can skip or default:
+            n = self.id2idx[row["bay_id"]]
+            for f, col in enumerate(features):
+                data[t, n, f] = row[col]
+            labels[t, n] = row["label"]
+
+        self.data      = data
+        self.labels    = labels
+        self.seq_len   = seq_len
+        self.horizon   = horizon
+        self.n_samples = T - seq_len - horizon + 1
+        self.num_nodes = N
+
+
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx: int):
+        # x: (seq_len, N, F) → (N, seq_len, F)
+        x = self.data[idx : idx + self.seq_len].transpose((1, 0, 2))
+        y = self.labels[idx + self.seq_len + self.horizon - 1]
+        return torch.from_numpy(x.copy()), torch.from_numpy(y)
+
+class GraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x, adj):
+        # x: (batch, N, in_features)
+        h = torch.matmul(adj, x)
+        return self.linear(h)
+
+class LSTMGCNN(nn.Module):
+    def __init__(self, num_nodes, in_feat, gcn_hidden, lstm_hidden, lstm_layers, dropout):
+        super().__init__()
+        self.gcn = GraphConvolution(in_feat, gcn_hidden)
+        self.lstm = nn.LSTM(
+            input_size=gcn_hidden,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=dropout,
+        )
+        self.classifier = nn.Linear(lstm_hidden, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, adj):
+        # x: (batch, N, seq_len, F)
+        B, N, L, _ = x.shape
+        # apply GCN at each timestep
+        x_time = x.permute(0, 2, 1, 3)  # (B, L, N, F)
+        gcn_seq = []
+        for t in range(L):
+            h = F.relu(self.gcn(x_time[:, t], adj))  # (B, N, gcn_hidden)
+            gcn_seq.append(h)
+        gcn_seq = torch.stack(gcn_seq, dim=1)       # (B, L, N, gcn_hidden)
+
+        # reshape for LSTM: one sequence per node
+        gcn_seq = gcn_seq.permute(0, 2, 1, 3).reshape(B * N, L, -1)
+        lstm_out, _ = self.lstm(gcn_seq)            # (B*N, L, lstm_hidden)
+        last = lstm_out[:, -1, :]                   # (B*N, lstm_hidden)
+        out  = self.classifier(self.dropout(last))  # (B*N, 1)
+        prob = torch.sigmoid(out).view(B, N)        # (B, N)
+        return prob
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+    for x, y in loader:
+        adj = loader.dataset.adj.unsqueeze(0).to(device)
+        x, y = x.to(device), y.float().to(device)
+        optimizer.zero_grad()
+        preds = model(x, adj)
+        loss = criterion(preds, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * x.size(0)
+    return total_loss / len(loader.dataset)
+
+def evaluate(model, loader, device):
+    model.eval()
+    all_p, all_y = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            adj = loader.dataset.adj.unsqueeze(0).to(device)
+            preds = model(x.to(device), adj).cpu().numpy().ravel()
+            all_p.append(preds); all_y.append(y.numpy().ravel())
+    p = np.concatenate(all_p); y = np.concatenate(all_y)
+    return {
+        "logloss": metrics.log_loss(y, p),
+        "brier":   ((p - y) ** 2).mean(),
+        "roc_auc": metrics.roc_auc_score(y, p),
+    }
