@@ -1,0 +1,136 @@
+# train_lstm_gcnn.py
+
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from sklearn.metrics.pairwise import haversine_distances
+
+from lstm_gcnn import ParkingDataset, LSTMGCNN, train_epoch, evaluate
+
+warnings.filterwarnings("ignore")
+
+print("🚧 BEGIN train_lstm_gcnn.py", flush=True)
+print("Python exe:", sys.executable, flush=True)
+
+
+class Args:
+    csv         = r"C:\Users\22348\Desktop\Paid_Parking__Last_48_Hours_.csv"
+    seq_len     = 12
+    horizon     = 1
+    batch       = 64
+    epochs      = 10
+    lr          = 1e-3
+    k           = 5
+    gcn_hidden  = 32
+    lstm_hidden = 64
+    lstm_layers = 2
+    dropout     = 0.1
+
+
+def build_adjacency(df_bays, k=5):
+    coords = np.radians(df_bays[["lat", "lon"]].to_numpy())
+    dist   = haversine_distances(coords)
+    idx    = np.argsort(dist, axis=1)[:, 1 : k + 1]
+    n      = len(df_bays)
+    adj    = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        adj[i, idx[i]] = 1.0
+    adj = np.maximum(adj, adj.T)
+    adj = adj / (adj.sum(1, keepdims=True) + 1e-8)
+    return torch.tensor(adj, dtype=torch.float32)
+
+
+def main():
+    args = Args()
+    print(f"📂 Loading CSV from {args.csv!r}", flush=True)
+    df = pd.read_csv(args.csv)
+
+    # normalize columns
+    df.columns = df.columns.str.replace(r"\s+", "", regex=True).str.strip()
+    print("✅ CSV shape:", df.shape, "— Columns:", df.columns.tolist(), flush=True)
+
+    # parse Location → lon/lat
+    coords = (
+        df["Location"]
+        .str.replace("POINT ", "", regex=False)
+        .str.strip("()")
+        .str.split(" ", expand=True)
+        .astype(float)
+    )
+    df["lon"], df["lat"] = coords[0], coords[1]
+
+    # rename & binary‐encode occupancy
+    df = df.rename(columns={
+        "SourceElementKey": "bay_id",
+        "OccupancyDateTime": "timestamp",
+        "PaidOccupancy":     "occupancy",
+    })
+    df["occupancy"] = (df["occupancy"] > 0).astype(int)
+    df["label"]     = 1 - df["occupancy"]
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df.sort_values(["timestamp", "bay_id"], inplace=True)
+
+    # global bay list + adjacency
+    full_bays = df[["bay_id","lat","lon"]].drop_duplicates().reset_index(drop=True)
+    bay_ids   = sorted(full_bays["bay_id"])
+    adj       = build_adjacency(full_bays, k=args.k)
+    print("✅ bay count:", len(bay_ids), "Adj shape:", adj.shape, flush=True)
+
+    # split
+    ts_all    = sorted(df["timestamp"].unique())
+    split     = int(0.8 * len(ts_all))
+    train_df  = df[df["timestamp"].isin(ts_all[:split])]
+    val_df    = df[df["timestamp"].isin(ts_all[split:])]
+    print("▶ train rows:", train_df.shape, "val rows:", val_df.shape, flush=True)
+
+    # datasets
+    features    = ["occupancy"]
+    train_ds    = ParkingDataset(train_df, args.seq_len, args.horizon, features, bay_ids=bay_ids)
+    val_ds      = ParkingDataset(val_df,   args.seq_len, args.horizon, features, bay_ids=bay_ids)
+    train_ds.adj = val_ds.adj = adj
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False)
+
+    # model setup
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model     = LSTMGCNN(
+        num_nodes=len(bay_ids),
+        in_feat=len(features),
+        gcn_hidden=args.gcn_hidden,
+        lstm_hidden=args.lstm_hidden,
+        lstm_layers=args.lstm_layers,
+        dropout=args.dropout,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    criterion = nn.BCELoss()
+
+    print("✅ Starting training…", flush=True)
+    # — ADDED DEBUG in train loop —
+    for ep in range(1, args.epochs + 1):
+        # Grab one batch just to inspect targets
+        x, y = next(iter(train_loader))
+        print(f"[DEBUG] y dtype/min/max: {y.dtype}/{y.min().item()}/{y.max().item()}", flush=True)
+        print(f"[DEBUG] y sample: {y.view(-1)[:20].tolist()}", flush=True)
+
+        # Now run a full epoch
+        loss    = train_epoch(model, train_loader, optimizer, criterion, device)
+        metrics = evaluate(model, val_loader, device)
+        print(
+            f"Epoch {ep}/{args.epochs} | "
+            f"train_loss={loss:.4f} | "
+            f"val_logloss={metrics['logloss']:.4f} | "
+            f"brier={metrics['brier']:.4f} | "
+            f"roc_auc={metrics['roc_auc']:.4f}",
+            flush=True
+        )
+
+if __name__ == "__main__":
+    main()
