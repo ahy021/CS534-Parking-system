@@ -1,0 +1,76 @@
+import pandas as pd
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+from neuralforecast.core import NeuralForecast
+from neuralforecast.models import PatchTST
+from neuralforecast.losses.numpy import mae, mse
+
+# -------- CONFIGURATION -------- #
+LOOKBACK = 32  # input length = 16 hours (32 * 30 min)
+HORIZON = 1  # predict next 30 min
+FREQ = '30min'
+DATA_FILE = 'Paid_Parking__Last_48_Hours_.csv'
+UNIQUE_ID = 'parking_area'  # artificial ID for NeuralForecast
+TARGET = 'PaidOccupancy'
+
+
+# -------- LOAD & PREPROCESS DATA -------- #
+def load_and_prepare_data(file_path):
+    df = pd.read_csv(file_path)
+    df['OccupancyDateTime'] = pd.to_datetime(df['OccupancyDateTime'], format='%m/%d/%Y %I:%M:%S %p')
+
+    # Create artificial unique_id since NeuralForecast expects panel data
+    df['unique_id'] = UNIQUE_ID
+
+    # Drop rows without occupancy or datetime
+    df = df[['unique_id', 'OccupancyDateTime', 'PaidOccupancy']].dropna()
+    df.rename(columns={'OccupancyDateTime': 'ds', 'PaidOccupancy': 'y'}, inplace=True)
+
+    # Resample to 30-minute intervals with forward fill
+    df.set_index('ds', inplace=True)
+    df = df.groupby('unique_id').resample(FREQ).mean(numeric_only=True).ffill().reset_index()
+
+    return df
+
+
+# -------- MAIN FUNCTION -------- #
+def main():
+    print("Loading and preparing data...")
+    df = load_and_prepare_data(DATA_FILE)
+
+    # Split into train/test
+    test_size = 4  # Next 2 hours = 4 steps of 30min
+    val_size = 8  # Last 4 hours = 8 steps of 30min
+
+    model = PatchTST(h=HORIZON, input_size=LOOKBACK, max_steps=50)
+
+    nf = NeuralForecast(models=[model], freq=FREQ)
+
+    print("Training PatchTST...")
+    preds_df = nf.cross_validation(df=df, val_size=val_size, test_size=test_size)
+
+    # Reshape for evaluation
+    y_true = preds_df['y'].values.reshape(1, -1, HORIZON)
+    y_pred = preds_df['PatchTST'].values.reshape(1, -1, HORIZON)
+
+    # Metrics
+    print("\nEvaluation Metrics (next 30 minutes):")
+    print(f"MAE: {mae(y_true, y_pred):.4f}")
+    print(f"MSE: {mse(y_true, y_pred):.4f}")
+
+    # Plot first prediction window
+    plt.figure(figsize=(10, 5))
+    plt.plot(y_true[0, 0], label='Actual', marker='o')
+    plt.plot(y_pred[0, 0], label='Predicted', marker='x')
+    plt.title('Parking Occupancy Prediction (Next 30 min)')
+    plt.xlabel('Step')
+    plt.ylabel('PaidOccupancy')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
