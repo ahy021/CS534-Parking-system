@@ -40,16 +40,16 @@ def main():
     print("Loading and preparing data...")
     df = load_and_prepare_data(DATA_FILE)
 
-    # Split into train/test
-    test_size = 4  # Next 2 hours = 4 steps of 30min
-    val_size = 8  # Last 4 hours = 8 steps of 30min
+   val_size = 8  # Last 4 hours = 8 steps of 30min
+n_windows = 1  # One forecasting window (next 30 min)
 
-    model = PatchTST(h=HORIZON, input_size=LOOKBACK, max_steps=50)
+model = PatchTST(h=HORIZON, input_size=LOOKBACK, max_steps=50)
 
-    nf = NeuralForecast(models=[model], freq=FREQ)
+nf = NeuralForecast(models=[model], freq=FREQ)
 
-    print("Training PatchTST...")
-    preds_df = nf.cross_validation(df=df, val_size=val_size, test_size=test_size)
+print("Training PatchTST...")
+preds_df = nf.cross_validation(df=df, val_size=val_size, n_windows=n_windows)
+
 
     # Reshape for evaluation
     y_true = preds_df['y'].values.reshape(1, -1, HORIZON)
