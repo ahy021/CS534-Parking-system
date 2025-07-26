@@ -1,70 +1,47 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-import copy
-from pathlib import Path
-import warnings
-
+import pandas as pd
 import lightning.pytorch as pl
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer, Baseline
+from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.metrics import MAE
+from pytorch_forecasting.models.temporal_fusion_transformer.tuning import optimize_hyperparameters
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger
-import numpy as np
-import pandas as pd
-import torch
+from optuna.integration import PyTorchLightningPruningCallback
+import optuna
 
-from pytorch_forecasting import Baseline, TemporalFusionTransformer, TimeSeriesDataSet
-from pytorch_forecasting.data import GroupNormalizer
-from lightning.pytorch.tuner import Tuner
-from pytorch_forecasting.metrics import MAE, SMAPE, QuantileLoss
-from pytorch_forecasting.models.temporal_fusion_transformer.tuning import (
-    optimize_hyperparameters,
-)
-import tensorflow as tf
-import tensorboard as tb
+from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
 
 def main():
+    # Load and preprocess data
     data = pd.read_csv("Paid_Parking__Last_48_Hours_.csv")
-
-    # This is for the organizing and labeling the data
-    # converting the string so we can sort by the month/day/year and the specific time (AM and PM).
     data["OccupancyDateTime"] = pd.to_datetime(data["OccupancyDateTime"], format="%m/%d/%Y %I:%M:%S %p")
-
-    # ensure that the data in is order of time for each of blockfacename(which is the location of the street)
     data = data.sort_values(["BlockfaceName", "OccupancyDateTime"])
-
-    # Create time_idx (integer-based index within each group)
     data["time_idx"] = data.groupby("BlockfaceName").cumcount()
-
-    # Extract time-based features
     data["hour"] = data["OccupancyDateTime"].dt.hour
     data["weekday"] = data["OccupancyDateTime"].dt.weekday
-
-    # Rename your target for simplicity
     data.rename(columns={"PaidOccupancy": "occupancy"}, inplace=True)
 
-    # Create Timeseries
-    max_prediction_length = 6  # how far ahead you want to forecast
-    max_encoder_length = 24  # history length to look back
+    # Binary classification: 1 if occupied (> 0), else 0
+    data["occupancy_binary"] = (data["occupancy"] > 0).astype(int)
 
-    training_cutoff = data["time_idx"].max() - max_prediction_length
-
-    # Convert categorical columns to string
     categorical_cols = [
-        "SideOfStreet",
-        "ParkingTimeLimitCategory",
-        "PaidParkingArea",
-        "PaidParkingSubArea",
-        "ParkingCategory"
+        "SideOfStreet", "ParkingTimeLimitCategory",
+        "PaidParkingArea", "PaidParkingSubArea", "ParkingCategory"
     ]
     data[categorical_cols] = data[categorical_cols].astype(str)
 
-    # Now define the dataset
+    max_prediction_length = 6  # Assuming 5-min intervals → 30 minutes
+    max_encoder_length = 24
+    training_cutoff = data["time_idx"].max() - max_prediction_length
+
     training = TimeSeriesDataSet(
         data[lambda x: x.time_idx <= training_cutoff],
         time_idx="time_idx",
-        target="occupancy",
+        target="occupancy_binary",
         group_ids=["BlockfaceName"],
-
         min_encoder_length=max_encoder_length // 2,
         max_encoder_length=max_encoder_length,
         min_prediction_length=1,
@@ -74,14 +51,13 @@ def main():
         time_varying_known_categoricals=[],
         time_varying_known_reals=["time_idx", "hour", "weekday"],
         time_varying_unknown_categoricals=[],
-        time_varying_unknown_reals=["occupancy"],
-        target_normalizer=GroupNormalizer(groups=["BlockfaceName"]),
+        time_varying_unknown_reals=["occupancy_binary"],
+        target_normalizer=None,  # Important for classification (don't normalize binary)
         add_relative_time_idx=True,
-        add_target_scales=True,
+        add_target_scales=False,
         add_encoder_length=True,
     )
 
-    # The validation set
     validation = TimeSeriesDataSet.from_dataset(
         training,
         data,
@@ -89,59 +65,61 @@ def main():
         stop_randomization=True
     )
 
-    # is how many samples we want the model to look at during the training or validations
-    batch_size = 64  # times series examples together(we can adjust it)
-
+    batch_size = 64
     train_dataloader = training.to_dataloader(train=True, batch_size=batch_size)
     val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size * 5)
 
-    from pytorch_forecasting.metrics import MAE
-    from pytorch_forecasting import Baseline
-
-    baseline_predictions = Baseline().predict(val_dataloader, return_y=True)
-    baseline_mae = MAE()(baseline_predictions.output, baseline_predictions.y[0])
-    print("Baseline MAE:", baseline_mae) # Baseline MAE: tensor(0.4505)
-
-    # configure network and trainer
+    # Fix seed
     pl.seed_everything(42)
 
-    trainer = pl.Trainer(
-        accelerator="cpu",
-        # clipping gradients is a hyperparameter and important to prevent divergence
-        # of the gradient for recurrent neural networks
-        gradient_clip_val=0.1,
-    )
+    optuna.logging.set_verbosity(optuna.logging.INFO)
 
-    tft = TemporalFusionTransformer.from_dataset(
-        training,
-        # not meaningful for finding the learning rate but otherwise very important
-        learning_rate=0.03,
-        hidden_size=8,  # most important hyperparameter apart from learning rate
-        # number of attention heads. Set to up to 4 for large datasets
-        attention_head_size=1,
-        dropout=0.1,  # between 0.1 and 0.3 are good values
-        hidden_continuous_size=8,  # set to <= hidden_size
-        loss=QuantileLoss(),
-        optimizer="ranger",
-        # reduce learning rate if no improvement in validation loss after x epochs
-        # reduce_on_plateau_patience=1000,
-    )
-    print(f"Number of parameters in network: {tft.size() / 1e3:.1f}k")  # Number of Parameters in network: 9.7k
-
-    # find optimal learning rate
-    from lightning.pytorch.tuner import Tuner
-
-    res = Tuner(trainer).lr_find(
-        tft,
+    # Run hyperparameter tuning
+    print("Running hyperparameter tuning...")
+    best_model_path, best_hyperparams = optimize_hyperparameters(
         train_dataloaders=train_dataloader,
         val_dataloaders=val_dataloader,
-        max_lr=10.0,
-        min_lr=1e-6,
+        model_path="tuned_model",
+        max_epochs=10,
+        n_trials=3,
+        timeout=3600,
+        gradient_clip_val_range=(0.01, 1.0),
+        hidden_size_range=(8, 32),
+        hidden_continuous_size_range=(8, 32),
+        attention_head_size_range=(1, 4),
+        learning_rate_range=(1e-4, 0.1),
+        dropout_range=(0.1, 0.3),
+        trainer_kwargs=dict(
+            accelerator="cpu",  # Change to "gpu" if you have one
+            logger=TensorBoardLogger("lightning_logs", name="tuning"),
+            enable_progress_bar=False
+        ),
     )
+    print("Best hyperparameters:", best_hyperparams)
 
-    print(f"suggested learning rate: {res.suggestion()}")  # suggested learning rate: 0.021877616239495523
-    fig = res.plot(show=True, suggest=True)
-    fig.show()
+    # Load the best model
+    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+
+    # Predict on validation with raw outputs for classification metrics
+    raw_preds, index = best_tft.predict(val_dataloader, mode="raw", return_y=True, return_index=True)
+
+    # Get probabilities and true binary targets
+    probs = raw_preds["prediction"].detach().cpu().numpy().flatten()
+    true = index["decoder_target"].detach().cpu().numpy().flatten()
+
+    # Ensure alignment
+    if len(probs) != len(true):
+        min_len = min(len(probs), len(true))
+        probs = probs[:min_len]
+        true = true[:min_len]
+
+    # Evaluation metrics
+    print("Log Loss:", log_loss(true, probs))
+    print("Brier Score:", brier_score_loss(true, probs))
+    print("ROC-AUC Score:", roc_auc_score(true, probs))
+
+    # Save final model
+    best_tft.save("best_tft_model.pt")
 
 if __name__ == "__main__":
     main()
