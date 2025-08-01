@@ -1,75 +1,99 @@
 import pandas as pd
-import numpy as np
-import torch
 import matplotlib.pyplot as plt
 
 from neuralforecast.core import NeuralForecast
 from neuralforecast.models import PatchTST
 from neuralforecast.losses.numpy import mae, mse
+from sklearn.metrics import r2_score
 
-# -------- CONFIGURATION -------- #
-LOOKBACK = 32  # input length = 16 hours (32 * 30 min)
-HORIZON = 1  # predict next 30 min
+# Step 1: Configuration
+LOOKBACK = 32
+HORIZON = 10
 FREQ = '30min'
 DATA_FILE = 'Paid_Parking__Last_48_Hours_.csv'
-UNIQUE_ID = 'parking_area'  # artificial ID for NeuralForecast
 TARGET = 'PaidOccupancy'
+UNIQUE_ID_COL = 'BlockfaceName'
 
-
-# -------- LOAD & PREPROCESS DATA -------- #
+# Step 2: Loading and preprocessing data
 def load_and_prepare_data(file_path):
     df = pd.read_csv(file_path)
     df['OccupancyDateTime'] = pd.to_datetime(df['OccupancyDateTime'], format='%m/%d/%Y %I:%M:%S %p')
 
-    # Create artificial unique_id since NeuralForecast expects panel data
-    df['unique_id'] = UNIQUE_ID
+    # Filter and rename columns
+    df = df[[UNIQUE_ID_COL, 'OccupancyDateTime', TARGET]].dropna()
+    df.rename(columns={'OccupancyDateTime': 'ds', TARGET: 'y', UNIQUE_ID_COL: 'unique_id'}, inplace=True)
 
-    # Drop rows without occupancy or datetime
-    df = df[['unique_id', 'OccupancyDateTime', 'PaidOccupancy']].dropna()
-    df.rename(columns={'OccupancyDateTime': 'ds', 'PaidOccupancy': 'y'}, inplace=True)
-
-    # Resample to 30-minute intervals with forward fill
+    # Set datetime index and resample
     df.set_index('ds', inplace=True)
     df = df.groupby('unique_id').resample(FREQ).mean(numeric_only=True).ffill().reset_index()
 
     return df
 
-
-# -------- MAIN FUNCTION -------- #
+# THE MAIN FUNCTION
 def main():
-    print("Loading and preparing data...")
+    print("Step 1: Loading and preparing data...")
     df = load_and_prepare_data(DATA_FILE)
 
-   val_size = 8  # Last 4 hours = 8 steps of 30min
-n_windows = 1  # One forecasting window (next 30 min)
+    val_size = 40
+    n_windows = 5
 
-model = PatchTST(h=HORIZON, input_size=LOOKBACK, max_steps=50)
+    print("Initializing PatchTST...")
+    model = PatchTST(h=HORIZON, input_size=LOOKBACK, max_steps=300)
+    nf = NeuralForecast(models=[model], freq=FREQ)
 
-nf = NeuralForecast(models=[model], freq=FREQ)
-
-print("Training PatchTST...")
-preds_df = nf.cross_validation(df=df, val_size=val_size, n_windows=n_windows)
-
+    print("Step 3: Training PatchTST...")
+    preds_df = nf.cross_validation(df=df, val_size=val_size, n_windows=n_windows)
 
     # Reshape for evaluation
     y_true = preds_df['y'].values.reshape(1, -1, HORIZON)
     y_pred = preds_df['PatchTST'].values.reshape(1, -1, HORIZON)
 
-    # Metrics
-    print("\nEvaluation Metrics (next 30 minutes):")
+    # Flatten for R²
+    y_true_flat = y_true.flatten()
+    y_pred_flat = y_pred.flatten()
+
+
+    print("\nStep 4: Evaluation Metrics (averaged across all locations & steps):")
     print(f"MAE: {mae(y_true, y_pred):.4f}")
     print(f"MSE: {mse(y_true, y_pred):.4f}")
+    # Compute R²
+    r2 = r2_score(y_true_flat, y_pred_flat)
+    print(f"R² Score: {r2:.4f}")
 
-    # Plot first prediction window
-    plt.figure(figsize=(10, 5))
-    plt.plot(y_true[0, 0], label='Actual', marker='o')
-    plt.plot(y_pred[0, 0], label='Predicted', marker='x')
-    plt.title('Parking Occupancy Prediction (Next 30 min)')
-    plt.xlabel('Step')
-    plt.ylabel('PaidOccupancy')
+    # Save Prediction
+    preds_df.to_csv('predictionsPATCHTST.csv', index=False)
+    print("Step 5: Saved predictions to predictionsPATCHTST.csv")
+
+    # FIXED AGGREGATED FORECAST PLOT
+    print("Step 6:Plotting aggregated forecast across all zones...")
+
+    # Aggregate over all zones by timestamp
+    agg_df = preds_df.groupby('ds')[['y', 'PatchTST']].mean()
+
+    # Reindex to ensure continuous time series
+    full_index = pd.date_range(start=agg_df.index.min(), end=agg_df.index.max(), freq=FREQ)
+    agg_df = agg_df.reindex(full_index)
+    agg_df.index.name = 'ds'
+    agg_df = agg_df.reset_index()
+    agg_df.fillna(method='ffill', inplace=True)
+
+    # Optional: smooth data with rolling average
+    agg_df['y'] = agg_df['y'].rolling(window=3, min_periods=1).mean()
+    agg_df['PatchTST'] = agg_df['PatchTST'].rolling(window=3, min_periods=1).mean()
+
+    # Plot
+    plt.figure(figsize=(14, 5))
+    plt.plot(agg_df['ds'], agg_df['y'], label='Actual (Avg)', marker='o')
+    plt.plot(agg_df['ds'], agg_df['PatchTST'], label='Predicted (Avg)', marker='x')
+    plt.title('Aggregated Occupancy Forecast Across All Zones')
+    plt.xlabel('Time')
+    plt.ylabel('Average PaidOccupancy')
     plt.legend()
+    plt.xticks(rotation=45)
     plt.tight_layout()
     plt.show()
+
+
 
 
 if __name__ == "__main__":
