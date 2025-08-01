@@ -59,7 +59,7 @@ def train_one_epoch(model, loader, optimizer, device):
         total_loss += loss.item()
 
         #print batch, loss, and time taken to run (for tracking purposes)
-        if i % 10000 == 0:
+        if i % 1000 == 0:
             print(f"Batch {i}/{len(loader)} | Loss: {loss.item():.4f} | Time: {time.time() - start_time:.2f}s")
             start_time = time.time()
 
@@ -67,7 +67,7 @@ def train_one_epoch(model, loader, optimizer, device):
     return avg_training_loss
 
 if __name__ == "__main__":
-    lookahead = 30 #looking 10 mins ahead
+    lookahead = 5 #looking 10 mins ahead
     dataset = ParkingDataset("prepared_data", lookahead, Td=1, Tw=0) # use 1 day prior for Xd and (for now) skip week data
     print(f"Total samples: {len(dataset)}")
 
@@ -93,15 +93,15 @@ if __name__ == "__main__":
 
     print(f"Train: {len(train_ds)} - Val: {len(val_ds)} | - Test: {len(test_ds)}")
 
-    # --- Device selection ---
+    # Device selection
     if torch.cuda.is_available():
-        print(f"CUDA is available. {torch.cuda.device_count()} GPU(s) detected:")
-        for i in range(torch.cuda.device_count()):
-            print(f"  [GPU {i}] {torch.cuda.get_device_name(i)}")
+        #print(f"CUDA is available. {torch.cuda.device_count()} GPU(s) detected:")
+        # for i in range(torch.cuda.device_count()):
+        #     print(f"  [GPU {i}] {torch.cuda.get_device_name(i)}")
         device = torch.device("cuda:0")
     else:
         device = torch.device("cpu")
-    print(f"Final device in use: {device}")
+    #print(f"Final device in use: {device}")
 
     torch.set_num_threads(os.cpu_count()) #set number of threads for PyTorch
 
@@ -125,11 +125,11 @@ if __name__ == "__main__":
         # Save best model
         if val_metrics['roc_auc'] > best_auc:
             best_auc = val_metrics['roc_auc']
-            torch.save(model.state_dict(), "best_model_30.pt")
-            print("Saved new best model to best_model_30.pt")
+            torch.save(model.state_dict(), "best_model_30_v2.pt")
+            print("Saved new best model to best_model_30_v2.pt")
 
     # Final Test Evaluation
     print("\nEvaluating best model on test set:")
-    model.load_state_dict(torch.load("best_model_30.pt"))
+    model.load_state_dict(torch.load("best_model_30_v2.pt"))
     test_metrics = evaluate(model, test_loader, device)
     print(f"Test Log Loss: {test_metrics['log_loss']:.4f}, Brier: {test_metrics['brier']:.4f}, ROC-AUC: {test_metrics['roc_auc']:.4f}")
