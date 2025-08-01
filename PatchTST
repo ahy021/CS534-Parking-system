@@ -52,10 +52,15 @@ def main():
     y_true_flat = y_true.flatten()
     y_pred_flat = y_pred.flatten()
 
+    
+    print("\nStep 4: Performance Metrics (averaged across all locations & steps):")
 
-    print("\nStep 4: Evaluation Metrics (averaged across all locations & steps):")
+    #Compute MAE
     print(f"MAE: {mae(y_true, y_pred):.4f}")
+
+    # Compute MSE
     print(f"MSE: {mse(y_true, y_pred):.4f}")
+
     # Compute R²
     r2 = r2_score(y_true_flat, y_pred_flat)
     print(f"R² Score: {r2:.4f}")
